@@ -1,4 +1,4 @@
-cflags = -std=c99 -O0 -g -Wall -Wextra -Wpedantic -Wshadow \
+cflags = -std=c99 -O2 -Wall -Wextra -Wpedantic -Wshadow \
 		-Werror=implicit-function-declaration -Werror=vla \
 		$(CFLAGS)
 ldflags = $(LDFLAGS)

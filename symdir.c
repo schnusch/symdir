@@ -31,58 +31,6 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <sys/types.h>
 #include <unistd.h>
 
-#ifdef DEBUG_MEM
-struct malloc_list {
-	void  *ptr;
-	size_t len;
-	unsigned int line;
-	struct malloc_list *next;
-};
-static struct malloc_list *malloced = NULL;
-static void *realloc2(void *oldptr, size_t len, unsigned int line)
-{
-	void *newptr = NULL;
-	if(len == 0)
-		free(oldptr);
-	else if(!(newptr = realloc(oldptr, len)))
-		return NULL;
-	if(oldptr)
-	{
-		for(struct malloc_list **pm = &malloced; *pm; pm = &(*pm)->next)
-			if((*pm)->ptr == oldptr)
-			{
-				if(len == 0)
-				{
-					struct malloc_list *m = *pm;
-					*pm = (*pm)->next;
-					free(m);
-				}
-				else
-				{
-					(*pm)->ptr  = newptr;
-					(*pm)->len  = len;
-					(*pm)->line = line;
-				}
-				break;
-			}
-	}
-	else
-	{
-		struct malloc_list *m = malloc(sizeof(*m));
-		if(!m)
-			abort();
-		m->ptr  = newptr;
-		m->len  = len;
-		m->line = line;
-		m->next = malloced;
-		malloced = m;
-	}
-	return newptr;
-}
-#define realloc(p, n)  realloc2(p, n, __LINE__)
-#define free(p)        realloc2(p, 0, __LINE__)
-#endif
-
 #define CHUNKSIZE 4096
 
 static int verbosity = 0;
@@ -895,15 +843,6 @@ int main(int argc, char **argv)
 
 	free(stuff.path.buf);
 	free(stuff.link.buf);
-
-#ifdef DEBUG_MEM
-	for(struct malloc_list *m = malloced, *n; m; m = n)
-	{
-		printf("leak %4u %p+%zu\n", m->line, m->ptr, m->len);
-		n = m->next;
-		free(m);
-	}
-#endif
 
 	return err;
 }
