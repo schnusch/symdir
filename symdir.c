@@ -24,6 +24,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,6 +33,7 @@ CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 #include <unistd.h>
 
 #define CHUNKSIZE 4096
+#define MAX(a, b)  ((a) ^ (((a) ^ (b)) & -((a) < (b))))
 
 static int verbosity = 0;
 static const char *argv0 = NULL;
@@ -90,7 +92,7 @@ enum {
 	FLAG_NONEMPTY = 4
 };
 
-typedef int (*operation_func)(int, DIR *, int, DIR *, struct asd *);
+typedef int (*command_func)(int, DIR *, int, DIR *, struct asd *, int);
 
 static void normalize_path(char *dst, const char *src)
 {
@@ -270,24 +272,6 @@ static int prepare_dir_path(struct asd *stuff, const char *dir)
 	return 0;
 }
 
-static int prepare_dir_path_chdir(struct asd *stuff, const char *dir)
-{
-	if(growing_getcwd(stuff) < 0)
-		return -1;
-	char *oldcwd = stuff->path.buf;
-	stuff->path.buf    = NULL;
-	stuff->path.buflen = 0;
-	if(chdir(dir) < 0 || growing_getcwd(stuff) < 0 || chdir(oldcwd) < 0)
-	{
-		int errbak = errno;
-		free(oldcwd);
-		errno = errbak;
-		return -1;
-	}
-	free(oldcwd);
-	return 0;
-}
-
 static const char *filetype(mode_t mode)
 {
 	switch(mode & S_IFMT)
@@ -363,66 +347,66 @@ static int growing_readlinkat(int dirfd, const char *name, struct asd *stuff)
 	return 0;
 }
 
-static int op_add    (int, DIR *, int, DIR *, struct asd *);
-static int op_rm     (int, DIR *, int, DIR *, struct asd *);
-static int op_refresh(int, DIR *, int, DIR *, struct asd *);
+static int cmd_add    (int, DIR *, int, DIR *, struct asd *, int);
+static int cmd_rm     (int, DIR *, int, DIR *, struct asd *, int);
+static int cmd_refresh(int, DIR *, int, DIR *, struct asd *, int);
 
-static int go_deeper(operation_func op, int fddir, int fdcoll, const char *name, struct asd *stuff, const char *namecoll)
+static int go_deeper(command_func cmd, int fdsrc, int fdsym, const char *name, struct asd *stuff, int depth, const char *namesym)
 {
 	size_t off = stuff->path.len;
-	if(!namecoll && path_append(stuff, name) < 0)
+	if(!namesym && path_append(stuff, name) < 0)
 	{
 		ERROR("cannot access "PATHFMT": %s", DIRPATH(stuff, name), strerror(errno));
 		return FLAG_ERROR | FLAG_NONEMPTY;
 	}
 
 	int  flags = 0;
-	DIR *ddir  = NULL;
-	DIR *dcoll = NULL;
+	DIR *dsrc  = NULL;
+	DIR *dsym  = NULL;
 
-	if(fddir != -1)
+	if(fdsrc != -1)
 	{
-		fddir = opendirat(op == op_rm ? NULL : &ddir, fddir, name);
-		if(fddir < 0)
+		fdsrc = opendirat(cmd == cmd_rm ? NULL : &dsrc, fdsrc, name);
+		if(fdsrc < 0)
 		{
 			if(errno == ENOENT)
 				goto skip;
 			ERROR("cannot open %s: %s", stuff->path.buf, strerror(errno));
-			fdcoll = -1;
+			fdsym = -1;
 			goto error;
 		}
 	}
 
-	if(namecoll)
-		name = namecoll;
-	fdcoll = opendirat(op == op_add ? NULL : &dcoll, fdcoll, name);
-	if(fdcoll < 0)
+	if(namesym)
+		name = namesym;
+	fdsym = opendirat(cmd == cmd_add ? NULL : &dsym, fdsym, name);
+	if(fdsym < 0)
 	{
 		if(errno != ENOENT)
 			flags |= FLAG_NONEMPTY;
-		if(namecoll)
+		if(namesym)
 			ERROR("cannot open %s: %s", name, strerror(errno));
 		else
 			ERROR("cannot open "PATHFMT": %s", COLLPATH(stuff, name), strerror(errno));
 		goto error;
 	}
 
-	flags = op(fddir, ddir, fdcoll, dcoll, stuff);
+	flags = cmd(fdsrc, dsrc, fdsym, dsym, stuff, depth);
 	if(0)
 	{
 	error:
 		flags |= FLAG_ERROR;
 	}
 
-	if(fddir >= 0)
+	if(fdsrc >= 0)
 	{
-		close(fddir);
-		closedir(ddir);
+		close(fdsrc);
+		closedir(dsrc);
 	}
-	if(fdcoll >= 0)
+	if(fdsym >= 0)
 	{
-		close(fdcoll);
-		closedir(dcoll);
+		close(fdsym);
+		closedir(dsym);
 	}
 
 skip:
@@ -431,11 +415,11 @@ skip:
 	return flags;
 }
 
-static int create_symlink(int fdcoll, const char *name, struct asd *stuff)
+static int create_symlink(int fdsym, const char *name, struct asd *stuff)
 {
 	size_t off = stuff->path.len;
 	int error = path_append(stuff, name) < 0
-			|| symlinkat(stuff->path.buf, fdcoll, name) < 0;
+			|| symlinkat(stuff->path.buf, fdsym, name) < 0;
 	path_remove(stuff, off);
 	if(error)
 	{
@@ -446,12 +430,12 @@ static int create_symlink(int fdcoll, const char *name, struct asd *stuff)
 	return FLAG_NONEMPTY;
 }
 
-static int remove_dir(int fdcoll, const char *name, struct asd *stuff)
+static int remove_dir(int fdsym, const char *name, struct asd *stuff)
 {
-	int flags = go_deeper(op_rm, -1, fdcoll, name, stuff, NULL);
+	int flags = go_deeper(cmd_rm, -1, fdsym, name, stuff, -1, NULL);
 	if(flags & FLAG_NONEMPTY)
 		(void)KEEP_LINK_MSG(stuff, name);
-	else if(unlinkat(fdcoll, name, AT_REMOVEDIR) < 0)
+	else if(unlinkat(fdsym, name, AT_REMOVEDIR) < 0)
 	{
 		if(errno != ENOENT)
 		{
@@ -464,19 +448,19 @@ static int remove_dir(int fdcoll, const char *name, struct asd *stuff)
 	return flags;
 }
 
-static int op_add(int fddir, DIR *ddir, int fdcoll, DIR *dcoll, struct asd *stuff)
+static int cmd_add(int fdsrc, DIR *dsrc, int fdsym, DIR *dsym, struct asd *stuff, int depth)
 {
-	(void)dcoll;
+	(void)dsym;
 	int flags = 0;
 	const struct dirent *ent;
-	while(errno = 0, (ent = readdir(ddir)))
+	while(errno = 0, (ent = readdir(dsrc)))
 	{
 		const char *name = ent->d_name;
 		if(name[0] == '.' && (!name[1] || (name[1] == '.' && !name[2])))
 			continue;
 
 		struct stat stdir;
-		if(fstatat(fddir, name, &stdir, AT_SYMLINK_NOFOLLOW) < 0)
+		if(fstatat(fdsrc, name, &stdir, AT_SYMLINK_NOFOLLOW) < 0)
 		{
 			if(errno == ENOENT)
 				continue;
@@ -485,11 +469,11 @@ static int op_add(int fddir, DIR *ddir, int fdcoll, DIR *dcoll, struct asd *stuf
 			continue;
 		}
 
-		if(growing_readlinkat(fdcoll, name, stuff) < 0)
+		if(growing_readlinkat(fdsym, name, stuff) < 0)
 		{
 			int exists;
 			struct stat stcoll;
-			if(errno != EINVAL || fstatat(fdcoll, name, &stcoll, AT_SYMLINK_NOFOLLOW) < 0)
+			if(errno != EINVAL || fstatat(fdsym, name, &stcoll, AT_SYMLINK_NOFOLLOW) < 0)
 			{
 				if(errno != ENOENT)
 				{
@@ -510,9 +494,11 @@ static int op_add(int fddir, DIR *ddir, int fdcoll, DIR *dcoll, struct asd *stuf
 
 			if(S_ISDIR(stdir.st_mode))
 			{
+				if(depth == 0)
+					continue;
 				if(!exists)
 				{
-					if(mkdirat(fdcoll, name, 0777) < 0)
+					if(mkdirat(fdsym, name, 0777) < 0)
 					{
 						ERROR("cannot create directory "PATHFMT": %s",
 								COLLPATH(stuff, name), strerror(errno));
@@ -521,7 +507,7 @@ static int op_add(int fddir, DIR *ddir, int fdcoll, DIR *dcoll, struct asd *stuf
 					}
 					INFO("created directory "PATHFMT, COLLPATH(stuff, name));
 				}
-				flags |= go_deeper(op_add, fddir, fdcoll, name, stuff, NULL);
+				flags |= go_deeper(cmd_add, fdsrc, fdsym, name, stuff, MAX(depth - 1, -1), NULL);
 			}
 			else if(exists)
 			{
@@ -529,7 +515,7 @@ static int op_add(int fddir, DIR *ddir, int fdcoll, DIR *dcoll, struct asd *stuf
 				ERROR(PATHFMT" is a %s", COLLPATH(stuff, name), filetype(stcoll.st_mode));
 			}
 			else
-				flags |= create_symlink(fdcoll, name, stuff);
+				flags |= create_symlink(fdsym, name, stuff);
 		}
 		else if(path_eq_link(stuff, name))
 		{
@@ -553,22 +539,22 @@ static int op_add(int fddir, DIR *ddir, int fdcoll, DIR *dcoll, struct asd *stuf
 	return flags;
 }
 
-static int op_rm(int fddir, DIR *ddir, int fdcoll, DIR *dcoll, struct asd *stuff)
+static int cmd_rm(int fdsrc, DIR *dsrc, int fdsym, DIR *dsym, struct asd *stuff, int depth)
 {
-	(void)fddir, (void)ddir;
+	(void)fdsrc, (void)dsrc, (void)depth;
 	int flags = 0;
 	const struct dirent *ent;
-	while(errno = 0, (ent = readdir(dcoll)))
+	while(errno = 0, (ent = readdir(dsym)))
 	{
 		const char *name = ent->d_name;
 		if(name[0] == '.' && (!name[1] || (name[1] == '.' && !name[2])))
 			continue;
 
 		const char *erraction;
-		if(growing_readlinkat(fdcoll, name, stuff) < 0)
+		if(growing_readlinkat(fdsym, name, stuff) < 0)
 		{
 			struct stat stcoll;
-			if(errno != EINVAL || fstatat(fdcoll, name, &stcoll, AT_SYMLINK_NOFOLLOW) < 0)
+			if(errno != EINVAL || fstatat(fdsym, name, &stcoll, AT_SYMLINK_NOFOLLOW) < 0)
 			{
 				if(errno == ENOENT)
 					continue;
@@ -578,7 +564,7 @@ static int op_rm(int fddir, DIR *ddir, int fdcoll, DIR *dcoll, struct asd *stuff
 
 			if(S_ISDIR(stcoll.st_mode))
 			{
-				flags |= remove_dir(fdcoll, name, stuff);
+				flags |= remove_dir(fdsym, name, stuff);
 				continue;
 			}
 			else
@@ -586,7 +572,7 @@ static int op_rm(int fddir, DIR *ddir, int fdcoll, DIR *dcoll, struct asd *stuff
 		}
 		else if(path_eq_link(stuff, name))
 		{
-			if(unlinkat(fdcoll, name, 0) < 0)
+			if(unlinkat(fdsym, name, 0) < 0)
 			{
 				if(errno == ENOENT)
 					continue;
@@ -614,22 +600,22 @@ static int op_rm(int fddir, DIR *ddir, int fdcoll, DIR *dcoll, struct asd *stuff
 	return flags;
 }
 
-static int op_refresh(int fddir, DIR *ddir, int fdcoll, DIR *dcoll, struct asd *stuff)
+static int cmd_refresh(int fdsrc, DIR *dsrc, int fdsym, DIR *dsym, struct asd *stuff, int depth)
 {
 	int flags = 0;
 	const struct dirent *ent;
 
 	// create links and directories that do not yet exist
-	while(errno = 0, (ent = readdir(ddir)))
+	while(errno = 0, (ent = readdir(dsrc)))
 	{
 		const char *name = ent->d_name;
 		if(name[0] == '.' && (!name[1] || (name[1] == '.' && !name[2])))
 			continue;
 
 		struct stat stcoll, stdir;
-		if(fstatat(fdcoll, name, &stcoll, AT_SYMLINK_NOFOLLOW) >= 0)
+		if(fstatat(fdsym, name, &stcoll, AT_SYMLINK_NOFOLLOW) >= 0)
 		{
-			// will be dealt with when iterating over dcoll
+			// will be dealt with when iterating over dsym
 			continue;
 		}
 		else if(errno != ENOENT)
@@ -639,7 +625,7 @@ static int op_refresh(int fddir, DIR *ddir, int fdcoll, DIR *dcoll, struct asd *
 			continue;
 		}
 
-		if(fstatat(fddir, name, &stdir, AT_SYMLINK_NOFOLLOW) < 0)
+		if(fstatat(fdsrc, name, &stdir, AT_SYMLINK_NOFOLLOW) < 0)
 		{
 			if(errno != ENOENT)
 			{
@@ -651,7 +637,9 @@ static int op_refresh(int fddir, DIR *ddir, int fdcoll, DIR *dcoll, struct asd *
 
 		if(S_ISDIR(stdir.st_mode))
 		{
-			if(mkdirat(fdcoll, name, 0777) < 0)
+			if(depth == 0)
+				continue;
+			if(mkdirat(fdsym, name, 0777) < 0)
 			{
 				ERROR("cannot create directory "PATHFMT": %s",
 						COLLPATH(stuff, name), strerror(errno));
@@ -659,11 +647,10 @@ static int op_refresh(int fddir, DIR *ddir, int fdcoll, DIR *dcoll, struct asd *
 				continue;
 			}
 			INFO("created directory "PATHFMT, COLLPATH(stuff, name));
-
-			flags |= go_deeper(op_add, fddir, fdcoll, name, stuff, NULL) | FLAG_NONEMPTY;
+			flags |= go_deeper(cmd_add, fdsrc, fdsym, name, stuff, MAX(depth - 1, -1), NULL) | FLAG_NONEMPTY;
 		}
 		else
-			flags |= create_symlink(fdcoll, name, stuff);
+			flags |= create_symlink(fdsym, name, stuff);
 	}
 	if(errno)
 	{
@@ -672,7 +659,7 @@ static int op_refresh(int fddir, DIR *ddir, int fdcoll, DIR *dcoll, struct asd *
 	}
 
 	// clean up existing links and directories
-	while(errno = 0, (ent = readdir(dcoll)))
+	while(errno = 0, (ent = readdir(dsym)))
 	{
 		const char *name = ent->d_name;
 		if(name[0] == '.' && (!name[1] || (name[1] == '.' && !name[2])))
@@ -680,7 +667,7 @@ static int op_refresh(int fddir, DIR *ddir, int fdcoll, DIR *dcoll, struct asd *
 
 		int exists;
 		struct stat stdir;
-		if(fstatat(fddir, name, &stdir, AT_SYMLINK_NOFOLLOW) < 0)
+		if(fstatat(fdsrc, name, &stdir, AT_SYMLINK_NOFOLLOW) < 0)
 		{
 			if(errno == ENOENT)
 				exists = 0;
@@ -694,10 +681,10 @@ static int op_refresh(int fddir, DIR *ddir, int fdcoll, DIR *dcoll, struct asd *
 		else
 			exists = 1;
 
-		if(growing_readlinkat(fdcoll, name, stuff) < 0)
+		if(growing_readlinkat(fdsym, name, stuff) < 0)
 		{
 			struct stat stcoll;
-			if(errno != EINVAL || fstatat(fdcoll, name, &stcoll, AT_SYMLINK_NOFOLLOW) < 0)
+			if(errno != EINVAL || fstatat(fdsym, name, &stcoll, AT_SYMLINK_NOFOLLOW) < 0)
 			{
 				if(errno != ENOENT)
 				{
@@ -708,14 +695,14 @@ static int op_refresh(int fddir, DIR *ddir, int fdcoll, DIR *dcoll, struct asd *
 			else if(!exists)
 			{
 				if(S_ISDIR(stcoll.st_mode))
-					flags |= remove_dir(fdcoll, name, stuff);
+					flags |= remove_dir(fdsym, name, stuff);
 				else
 					flags |= SKIP_NONLINK_MSG(stuff, name);
 			}
 			else if(S_ISDIR(stdir.st_mode) != S_ISDIR(stcoll.st_mode))
 				flags |= DIR_CONFLICT_ERROR(stuff, name, stdir, stcoll);
 			else if(S_ISDIR(stcoll.st_mode))
-				flags |= go_deeper(op_refresh, fddir, fdcoll, name, stuff, NULL);
+				flags |= go_deeper(cmd_refresh, fdsrc, fdsym, name, stuff, -1, NULL);
 			else
 			{
 				// conflicting file exists
@@ -728,7 +715,7 @@ static int op_refresh(int fddir, DIR *ddir, int fdcoll, DIR *dcoll, struct asd *
 			// symlink to the same file
 			if(exists)
 				flags |= KEEP_LINK_MSG(stuff, name);
-			else if(unlinkat(fdcoll, name, 0) < 0)
+			else if(unlinkat(fdsym, name, 0) < 0)
 			{
 				if(errno == ENOENT)
 					continue;
@@ -752,97 +739,167 @@ static int op_refresh(int fddir, DIR *ddir, int fdcoll, DIR *dcoll, struct asd *
 
 int main(int argc, char **argv)
 {
-	argv0 = argv[0];
-	int (*operation)(int, DIR *, int, DIR *, struct asd *);
-	const char *coll = NULL;
-	int normalize = 1;
-
-	static const struct option longopts[] = {
-		{"chdir",      no_argument,       NULL, 'd'},
+	static const struct option globalopts[] = {
 		{"collection", required_argument, NULL, 'c'},
 		{"help",       no_argument,       NULL, 'h'},
 		{"verbose",    no_argument,       NULL, 'v'},
-		{NULL,         0,                 NULL, 0}
+		{NULL, 0, NULL, 0}
 	};
-	int opt;
-	while((opt = getopt_long(argc, argv, "c:hv", longopts, NULL)) != -1)
+	static const char globaloptstr[] = "hv";
+
+	static const struct option addopts[] = {
+		{"collection", required_argument, NULL, 'c'},
+		{"depth",      no_argument,       NULL, 'd'},
+		{"help",       no_argument,       NULL, 'h'},
+		{"verbose",    no_argument,       NULL, 'v'},
+		{NULL, 0, NULL, 0}
+	};
+	static const char addoptstr[] = "d:hv";
+
+	argv0 = argv[0];
+	command_func cmd;
+	const char  *cmdstr;
+	const char  *coll = NULL;
+	int          opt;
+	int          depth = -1;
+
+	int resetenv = !getenv("POSIXLY_CORRECT");
+	if(resetenv && setenv("POSIXLY_CORRECT", "", 0) < 0)
+	{
+		ERROR("%s", strerror(errno));
+		return 1;
+	}
+
+	while((opt = getopt_long(argc, argv, globaloptstr, globalopts, NULL)) != -1)
+	{
 		switch(opt)
 		{
+		case 'h':
+			printf("usage: %s [-h | --help] [-v | --verbose]... [--collection=<path>]\n"
+					"              <command> [<option>]... <dir>\n"
+					"Manage a directory full of symlinks. command must be one of add, refresh, and remove.\n"
+					"\n"
+					"Mandatory arguments to long optionas are mandatory for short options too.\n"
+					"      --collection=<path>    s\n"
+					"  -v, --verbose              increase verbosity\n"
+					"  -h, --help                 display this help and exit\n",
+					argv0);
+			return 0;
+		case 'c':
+			coll = optarg;
+			break;
+		case 'v':
+			verbosity++;
+			continue;
+		default:
+			return 2;
+		}
+
+		// TODO guess last arg and remove POSIXLY_CORRECT environment shenanigans
+	}
+
+	if(resetenv)
+		unsetenv("POSIXLY_CORRECT");
+
+	const struct option *cmdopts;
+	const char *cmdoptstr;
+	if(optind == argc)
+	{
+		ERROR("no command given");
+		return 2;
+	}
+	else if(strcmp(argv[optind], "refresh") == 0)
+	{
+		cmd     = cmd_refresh, cmdstr    = "refresh";
+		cmdopts = addopts,     cmdoptstr = addoptstr;
+	}
+	else if(strcmp(argv[optind], "add") == 0)
+	{
+		cmd     = cmd_add, cmdstr    = "add";
+		cmdopts = addopts, cmdoptstr = addoptstr;
+	}
+	else if(strcmp(argv[optind], "rm") == 0 || strcmp(argv[optind], "remove") == 0)
+	{
+		cmd     = cmd_rm,     cmdstr    = "remove";
+		cmdopts = globalopts, cmdoptstr = globaloptstr;
+	}
+	else
+	{
+		ERROR("unknown command: %s", argv[optind]);
+		return 2;
+	}
+	optind++;
+
+	unsigned long ldepth;
+	char *end;
+	while((opt = getopt_long(argc, argv, cmdoptstr, cmdopts, NULL)) != -1)
+		switch(opt)
+		{
+		case 'h':
+			printf("usage: %s %s [-h | --help] [-v | --verbose]... [--collection=<path>]\n"
+					"              <command> [<option>]... <dir>\n"
+					"%s\n"
+					"\n"
+					"Mandatory arguments to long optionas are mandatory for short options too.\n"
+					"      --collection=<path>    TODO description\n"
+					"%s"
+					"  -v, --verbose              increase verbosity\n"
+					"  -h, --help                 display this help and exit\n",
+					argv0, cmdstr,
+					"TODO description",
+					cmdopts == addopts ? "  -d, --depth=<depth>        set recursion depth, unlimited by default\n" : "");
+			return 0;
 		case 'c':
 			coll = optarg;
 			break;
 		case 'd':
-			normalize = 0;
+			ldepth = strtoul(optarg, &end, 0);
+			if(ldepth > INT_MAX || *end)
+			{
+				ERROR("cannot parse depth %s: %s", optarg, strerror(*end ? EINVAL : ERANGE));
+				return 2;
+			}
+			depth = ldepth;
 			break;
-		case 'h':
-			printf("%s [add|refresh|remove] [OPTION]... DIR\n"
-					"\n"
-					"  -c, --collection=COLL      use collection direcotry COLL instead of .\n"
-					"  -d, --chdir                normalize path of DIR by changing directory to it\n"
-					"                             and back again instead of a naive algoritm\n"
-					"  -v, --verbose  increases verbosity\n"
-					"  -h, --help     display this help and exit\n", argv0);
-			return 0;
 		case 'v':
 			verbosity++;
 			break;
 		default:
 			return 2;
 		}
-	if(optind == argc)
-	{
-		ERROR("no operation given");
-		return 2;
-	}
-	else if(strcmp(argv[optind], "refresh") == 0)
-		operation = op_refresh;
-	else if(strcmp(argv[optind], "add") == 0)
-		operation = op_add;
-	else if(strcmp(argv[optind], "rm") == 0 || strcmp(argv[optind], "remove") == 0)
-		operation = op_rm;
-	else
-	{
-		ERROR("unknown operation: %s", argv[optind]);
-		return 2;
-	}
-	optind++;
 
 	if(optind + 1 != argc)
 	{
-		ERROR("%s", optind == argc ? "no directory given" : "trailing arguments");
+		ERROR("%s", optind == argc ? "no directory given" : "unexpected trailing arguments");
 		return 2;
 	}
 
+	int error = 0;
 	struct asd stuff = {
 		.coll = coll
 	};
-	int err = 0;
 
-	if((normalize ? prepare_dir_path : prepare_dir_path_chdir)(&stuff, argv[optind]) < 0)
+	if(prepare_dir_path(&stuff, argv[optind]) < 0)
 	{
 		ERROR("%s", strerror(errno));
 		goto error;
 	}
 
-	INFO("%s %s %s %s",
-			operation == op_refresh ? "refresh" :
-			operation == op_add     ? "add"     :
-			"remove",
-			stuff.path.buf,
-			operation == op_refresh ? "in" :
-			operation == op_add     ? "to" :
+	INFO("%s %s %s %s", cmdstr, stuff.path.buf,
+			cmd == cmd_refresh ? "in" :
+			cmd == cmd_add     ? "to" :
 			"from",
 			coll ? coll : ".");
 
-	if(go_deeper(operation, operation == op_rm ? -1 : AT_FDCWD, AT_FDCWD,
-			stuff.path.buf, &stuff, coll ? coll : ".") & (FLAG_ERROR | FLAG_WARN))
+	if(go_deeper(cmd, cmd == cmd_rm ? -1 : AT_FDCWD, AT_FDCWD,
+			stuff.path.buf, &stuff, depth, coll ? coll : ".") & (FLAG_ERROR | FLAG_WARN))
 	{
 	error:
-		err = 1;
+		error = 1;
 	}
 
 	free(stuff.path.buf);
 	free(stuff.link.buf);
 
-	return err;
+	return error;
 }
