@@ -1,4 +1,4 @@
-.. include:: man.rst
+`manpage <man.rst>`_
 
 BUILD
 =====
@@ -7,7 +7,6 @@ BUILD
 		`[INSTALL=<install>]` `[PREFIX=<prefix>]` `[DESTDIR=<destdir>]` <target>
 
 *target*
-
 	**all**
 
 	**install**
