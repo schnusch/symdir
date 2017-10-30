@@ -327,7 +327,12 @@ static int path_eq_link(struct asd *stuff, const char *name)
 
 static int path_valid_link(struct asd *stuff, const char *name)
 {
-	return is_normalized_path(stuff->link.buf) && 1;
+	if(!is_normalized_path(stuff->link.buf))
+		return 0;
+	const char *lname = strrchr(stuff->link.buf, '/');
+	if(!lname)
+		return 0;
+	return strcmp(lname + 1, name) == 0;
 }
 
 static int growing_readlinkat(int dirfd, const char *name, struct asd *stuff)
