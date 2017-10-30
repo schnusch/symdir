@@ -73,26 +73,33 @@ struct asd {
 				(s)->coll || (s)->path.len > (s)->path.off ? "" : "."
 
 #define INVALID_SYMLINK_ERROR(stuff, name) \
-		(WARN("invalid symlink "PATHFMT": %s", COLLPATH(stuff, name), (stuff)->link.buf), FLAG_WARN)
+		(WARN("invalid symlink '"PATHFMT"': %s", COLLPATH(stuff, name), (stuff)->link.buf), FLAG_WARN)
 #define DIR_CONFLICT_ERROR(stuff, name, stdir, stcoll) \
-		(ERROR(PATHFMT" is a %s but "PATHFMT" is a %s%s%s",          \
+		(ERROR("'"PATHFMT"' is a %s but '"PATHFMT"' is a %s%s%s",          \
 				DIRPATH((stuff), name),  filetype((stdir).st_mode),  \
 				COLLPATH((stuff), name), filetype((stcoll).st_mode), \
 				S_ISLNK((stcoll).st_mode) ? " to "            : "",  \
 				S_ISLNK((stcoll).st_mode) ? (stuff)->link.buf : ""), FLAG_ERROR | FLAG_NONEMPTY)
 
 #define SKIP_NONLINK_MSG(stuff, name) \
-		(DEBUG("skipped "PATHFMT, COLLPATH(stuff, name)), FLAG_NONEMPTY)
+		(DEBUG("skipped '"PATHFMT"'", COLLPATH(stuff, name)), FLAG_NONEMPTY)
 #define KEEP_LINK_MSG(stuff, name) \
-		(DEBUG("kept    "PATHFMT, COLLPATH(stuff, name)), FLAG_NONEMPTY)
+		(DEBUG("kept    '"PATHFMT"'", COLLPATH(stuff, name)), FLAG_NONEMPTY)
 
 enum {
-	FLAG_ERROR    = 1,
-	FLAG_WARN     = 2,
-	FLAG_NONEMPTY = 4
+	FLAG_ERROR      = 0x01,
+	FLAG_WARN       = 0x02,
+	FLAG_NONEMPTY   = 0x04,
+	FLAG_ADD_MKDIR  = 0x08,
+	FLAG_RM_NONLINK = 0x10,
 };
 
 typedef int (*command_func)(int, DIR *, int, DIR *, struct asd *, int);
+
+static int is_pdir_cdir(const char *name)
+{
+	return name[0] == '.' && (!name[1] || (name[1] == '.' && !name[2]));
+}
 
 static void normalize_path(char *dst, const char *src)
 {
@@ -184,14 +191,10 @@ static int is_normalized_path(const char *path)
 		if(*path == '.')
 		{
 			path++;
+			if(*path == '.')
+				path++;
 			if(*path == '/' || !*path)
 				return 0;
-			if(*path == '.')
-			{
-				path++;
-				if(*path == '/' || !*path)
-					return 0;
-			}
 		}
 		path = strchr(path, '/');
 		if(path)
@@ -361,7 +364,7 @@ static int go_deeper(command_func cmd, int fdsrc, int fdsym, const char *name, s
 	size_t off = stuff->path.len;
 	if(!namesym && path_append(stuff, name) < 0)
 	{
-		ERROR("cannot access "PATHFMT": %s", DIRPATH(stuff, name), strerror(errno));
+		ERROR("cannot access '"PATHFMT"': %s", DIRPATH(stuff, name), strerror(errno));
 		return FLAG_ERROR | FLAG_NONEMPTY;
 	}
 
@@ -392,7 +395,7 @@ static int go_deeper(command_func cmd, int fdsrc, int fdsym, const char *name, s
 		if(namesym)
 			ERROR("cannot open %s: %s", name, strerror(errno));
 		else
-			ERROR("cannot open "PATHFMT": %s", COLLPATH(stuff, name), strerror(errno));
+			ERROR("cannot open '"PATHFMT"': %s", COLLPATH(stuff, name), strerror(errno));
 		goto error;
 	}
 
@@ -420,21 +423,6 @@ skip:
 	return flags;
 }
 
-static int create_symlink(int fdsym, const char *name, struct asd *stuff)
-{
-	size_t off = stuff->path.len;
-	int error = path_append(stuff, name) < 0
-			|| symlinkat(stuff->path.buf, fdsym, name) < 0;
-	path_remove(stuff, off);
-	if(error)
-	{
-		ERROR("cannot create symlink "PATHFMT": %s", COLLPATH(stuff, name), strerror(errno));
-		return FLAG_ERROR;
-	}
-	INFO("created symlink "PATHFMT, COLLPATH(stuff, name));
-	return FLAG_NONEMPTY;
-}
-
 static int remove_dir(int fdsym, const char *name, struct asd *stuff)
 {
 	int flags = go_deeper(cmd_rm, -1, fdsym, name, stuff, -1, NULL);
@@ -444,13 +432,140 @@ static int remove_dir(int fdsym, const char *name, struct asd *stuff)
 	{
 		if(errno != ENOENT)
 		{
-			ERROR("cannot unlink "PATHFMT": %s", COLLPATH(stuff, name), strerror(errno));
+			ERROR("cannot unlink '"PATHFMT"': %s", COLLPATH(stuff, name), strerror(errno));
 			flags |= FLAG_NONEMPTY;
 		}
 	}
 	else
-		INFO("removed "PATHFMT, COLLPATH(stuff, name));
+		INFO("removed '"PATHFMT"'", COLLPATH(stuff, name));
 	return flags;
+}
+
+static int add_symlink(int fdsrc, int fdsym, const char *name, struct asd *stuff, int depth)
+{
+	struct stat stdir, stcoll;
+	if(fstatat(fdsrc, name, &stdir, AT_SYMLINK_NOFOLLOW) < 0)
+	{
+		if(errno == ENOENT)
+			return 0;
+		ERROR("cannot access '"PATHFMT"': %s", DIRPATH(stuff, name), strerror(errno));
+		return FLAG_ERROR;
+	}
+
+	if(growing_readlinkat(fdsym, name, stuff) < 0)
+	{
+		int exists;
+		if(errno != EINVAL || fstatat(fdsym, name, &stcoll, AT_SYMLINK_NOFOLLOW) < 0)
+		{
+			if(errno != ENOENT)
+			{
+				ERROR("cannot access '"PATHFMT"': %s", COLLPATH(stuff, name),
+						strerror(errno));
+				return FLAG_ERROR;
+			}
+			exists = 0;
+		}
+		else if(S_ISDIR(stdir.st_mode) != S_ISDIR(stcoll.st_mode))
+			return DIR_CONFLICT_ERROR(stuff, name, stdir, stcoll);
+		else
+			exists = 1;
+
+		if(S_ISDIR(stdir.st_mode))
+		{
+			if(depth == 0)
+				return 0;
+			if(!exists)
+			{
+				if(mkdirat(fdsym, name, 0777) < 0)
+				{
+					ERROR("cannot create directory '"PATHFMT"': %s",
+							COLLPATH(stuff, name), strerror(errno));
+					return FLAG_ERROR;
+				}
+				INFO("created directory '"PATHFMT"'", COLLPATH(stuff, name));
+			}
+			return FLAG_ADD_MKDIR;
+		}
+		else if(exists)
+		{
+			// conflicting file exists
+			ERROR("'"PATHFMT"' is a %s", COLLPATH(stuff, name), filetype(stcoll.st_mode));
+			return FLAG_WARN;
+		}
+		else
+		{
+			size_t off = stuff->path.len;
+			int error = path_append(stuff, name) < 0
+					|| symlinkat(stuff->path.buf, fdsym, name) < 0;
+			path_remove(stuff, off);
+			if(error)
+			{
+				ERROR("cannot create symlink '"PATHFMT"': %s", COLLPATH(stuff, name), strerror(errno));
+				return FLAG_ERROR;
+			}
+			INFO("created symlink '"PATHFMT"'", COLLPATH(stuff, name));
+			return FLAG_NONEMPTY;
+		}
+	}
+	else if(path_eq_link(stuff, name))
+	{
+		// symlink to the same file
+		DEBUG("'"PATHFMT"' already exists", COLLPATH(stuff, name));
+		return 0;
+	}
+	else if(path_valid_link(stuff, name))
+	{
+		// symlink to another file
+		WARN("'"PATHFMT"' already links to '%s'", COLLPATH(stuff, name), stuff->link.buf);
+		return FLAG_WARN;
+	}
+	else
+		return INVALID_SYMLINK_ERROR(stuff, name);
+}
+
+static int rm_symlink(int fdsym, struct asd *stuff, const char *name, struct stat *stcoll, int exists)
+{
+	if(growing_readlinkat(fdsym, name, stuff) < 0)
+	{
+		if(errno != EINVAL || fstatat(fdsym, name, stcoll, AT_SYMLINK_NOFOLLOW) < 0)
+		{
+			if(errno == ENOENT)
+				return 0;
+			ERROR("cannot access '"PATHFMT"': %s", COLLPATH(stuff, name), strerror(errno));
+			return FLAG_ERROR;
+		}
+		else if(!exists)
+		{
+			if(S_ISDIR(stcoll->st_mode))
+				return remove_dir(fdsym, name, stuff);
+			else
+				return SKIP_NONLINK_MSG(stuff, name);
+		}
+		else
+			return FLAG_RM_NONLINK;
+	}
+	else if(path_eq_link(stuff, name))
+	{
+		// symlink to the same file
+		if(exists)
+			return KEEP_LINK_MSG(stuff, name);
+		else if(unlinkat(fdsym, name, 0) < 0)
+		{
+			if(errno == ENOENT)
+				return 0;
+			ERROR("cannot unlink '"PATHFMT"': %s", COLLPATH(stuff, name), strerror(errno));
+			return FLAG_ERROR | FLAG_NONEMPTY;
+		}
+		else
+		{
+			INFO("removed '"PATHFMT"'", COLLPATH(stuff, name));
+			return 0;
+		}
+	}
+	else if(path_valid_link(stuff, name))
+		return KEEP_LINK_MSG(stuff, name);
+	else
+		return INVALID_SYMLINK_ERROR(stuff, name);
 }
 
 static int cmd_add(int fdsrc, DIR *dsrc, int fdsym, DIR *dsym, struct asd *stuff, int depth)
@@ -461,84 +576,19 @@ static int cmd_add(int fdsrc, DIR *dsrc, int fdsym, DIR *dsym, struct asd *stuff
 	while(errno = 0, (ent = readdir(dsrc)))
 	{
 		const char *name = ent->d_name;
-		if(name[0] == '.' && (!name[1] || (name[1] == '.' && !name[2])))
+		if(is_pdir_cdir(name))
 			continue;
 
-		struct stat stdir;
-		if(fstatat(fdsrc, name, &stdir, AT_SYMLINK_NOFOLLOW) < 0)
+		flags |= add_symlink(fdsrc, fdsym, name, stuff, depth);
+		if(flags & FLAG_ADD_MKDIR)
 		{
-			if(errno == ENOENT)
-				continue;
-			ERROR("cannot access "PATHFMT": %s", DIRPATH(stuff, name), strerror(errno));
-			flags |= FLAG_ERROR;
-			continue;
+			flags &= ~FLAG_ADD_MKDIR;
+			flags |= go_deeper(cmd_add, fdsrc, fdsym, name, stuff, MAX(depth - 1, -1), NULL);
 		}
-
-		if(growing_readlinkat(fdsym, name, stuff) < 0)
-		{
-			int exists;
-			struct stat stcoll;
-			if(errno != EINVAL || fstatat(fdsym, name, &stcoll, AT_SYMLINK_NOFOLLOW) < 0)
-			{
-				if(errno != ENOENT)
-				{
-					ERROR("cannot access "PATHFMT": %s", COLLPATH(stuff, name),
-							strerror(errno));
-					flags |= FLAG_ERROR;
-					continue;
-				}
-				exists = 0;
-			}
-			else if(S_ISDIR(stdir.st_mode) != S_ISDIR(stcoll.st_mode))
-			{
-				flags |= DIR_CONFLICT_ERROR(stuff, name, stdir, stcoll);
-				continue;
-			}
-			else
-				exists = 1;
-
-			if(S_ISDIR(stdir.st_mode))
-			{
-				if(depth == 0)
-					continue;
-				if(!exists)
-				{
-					if(mkdirat(fdsym, name, 0777) < 0)
-					{
-						ERROR("cannot create directory "PATHFMT": %s",
-								COLLPATH(stuff, name), strerror(errno));
-						flags |= FLAG_ERROR;
-						continue;
-					}
-					INFO("created directory "PATHFMT, COLLPATH(stuff, name));
-				}
-				flags |= go_deeper(cmd_add, fdsrc, fdsym, name, stuff, MAX(depth - 1, -1), NULL);
-			}
-			else if(exists)
-			{
-				// conflicting file exists
-				ERROR(PATHFMT" is a %s", COLLPATH(stuff, name), filetype(stcoll.st_mode));
-			}
-			else
-				flags |= create_symlink(fdsym, name, stuff);
-		}
-		else if(path_eq_link(stuff, name))
-		{
-			// symlink to the same file
-			DEBUG(PATHFMT" already exists", COLLPATH(stuff, name));
-		}
-		else if(path_valid_link(stuff, name))
-		{
-			// symlink to another file
-			WARN(PATHFMT" already links to %s", COLLPATH(stuff, name), stuff->link.buf);
-			flags |= FLAG_WARN;
-		}
-		else
-			flags |= INVALID_SYMLINK_ERROR(stuff, name);
 	}
 	if(errno)
 	{
-		ERROR("cannot read "PATHFMT": %s", DIRPATH(stuff, NULL), strerror(errno));
+		ERROR("cannot read '"PATHFMT"': %s", DIRPATH(stuff, NULL), strerror(errno));
 		flags |= FLAG_ERROR;
 	}
 	return flags;
@@ -552,54 +602,23 @@ static int cmd_rm(int fdsrc, DIR *dsrc, int fdsym, DIR *dsym, struct asd *stuff,
 	while(errno = 0, (ent = readdir(dsym)))
 	{
 		const char *name = ent->d_name;
-		if(name[0] == '.' && (!name[1] || (name[1] == '.' && !name[2])))
+		if(is_pdir_cdir(name))
 			continue;
 
-		const char *erraction;
-		if(growing_readlinkat(fdsym, name, stuff) < 0)
+		struct stat stcoll;
+		flags |= rm_symlink(fdsym, stuff, name, &stcoll, 0);
+		if(flags & FLAG_RM_NONLINK)
 		{
-			struct stat stcoll;
-			if(errno != EINVAL || fstatat(fdsym, name, &stcoll, AT_SYMLINK_NOFOLLOW) < 0)
-			{
-				if(errno == ENOENT)
-					continue;
-				erraction = "access";
-				goto error;
-			}
-
+			flags &= ~FLAG_RM_NONLINK;
 			if(S_ISDIR(stcoll.st_mode))
-			{
 				flags |= remove_dir(fdsym, name, stuff);
-				continue;
-			}
 			else
-				(void)SKIP_NONLINK_MSG(stuff, name);
+				flags |= SKIP_NONLINK_MSG(stuff, name);
 		}
-		else if(path_eq_link(stuff, name))
-		{
-			if(unlinkat(fdsym, name, 0) < 0)
-			{
-				if(errno == ENOENT)
-					continue;
-				erraction = "unlink";
-			error:
-				ERROR("cannot %s "PATHFMT": %s", erraction,
-						COLLPATH(stuff, name), strerror(errno));
-				flags |= FLAG_ERROR | FLAG_NONEMPTY;
-			}
-			else
-				INFO("removed "PATHFMT, COLLPATH(stuff, name));
-			continue;
-		}
-		else if(path_valid_link(stuff, name))
-			(void)KEEP_LINK_MSG(stuff, name);
-		else
-			flags |= INVALID_SYMLINK_ERROR(stuff, name);
-		flags |= FLAG_NONEMPTY;
 	}
 	if(errno)
 	{
-		ERROR("cannot read "PATHFMT": %s", COLLPATH(stuff, NULL), strerror(errno));
+		ERROR("cannot read '"PATHFMT"': %s", COLLPATH(stuff, NULL), strerror(errno));
 		flags |= FLAG_ERROR | FLAG_NONEMPTY;
 	}
 	return flags;
@@ -614,52 +633,19 @@ static int cmd_refresh(int fdsrc, DIR *dsrc, int fdsym, DIR *dsym, struct asd *s
 	while(errno = 0, (ent = readdir(dsrc)))
 	{
 		const char *name = ent->d_name;
-		if(name[0] == '.' && (!name[1] || (name[1] == '.' && !name[2])))
+		if(is_pdir_cdir(name))
 			continue;
 
-		struct stat stcoll, stdir;
-		if(fstatat(fdsym, name, &stcoll, AT_SYMLINK_NOFOLLOW) >= 0)
+		flags |= add_symlink(fdsrc, fdsym, name, stuff, depth);
+		if(flags & FLAG_ADD_MKDIR)
 		{
-			// will be dealt with when iterating over dsym
-			continue;
+			flags &= ~FLAG_ADD_MKDIR;
+			flags |= go_deeper(cmd_add, fdsrc, fdsym, name, stuff, MAX(depth - 1, -1), NULL);
 		}
-		else if(errno != ENOENT)
-		{
-			ERROR("cannot access "PATHFMT": %s", COLLPATH(stuff, name), strerror(errno));
-			flags |= FLAG_ERROR | FLAG_NONEMPTY;
-			continue;
-		}
-
-		if(fstatat(fdsrc, name, &stdir, AT_SYMLINK_NOFOLLOW) < 0)
-		{
-			if(errno != ENOENT)
-			{
-				ERROR("cannot access "PATHFMT": %s", DIRPATH(stuff, name), strerror(errno));
-				flags |= FLAG_ERROR;
-			}
-			continue;
-		}
-
-		if(S_ISDIR(stdir.st_mode))
-		{
-			if(depth == 0)
-				continue;
-			if(mkdirat(fdsym, name, 0777) < 0)
-			{
-				ERROR("cannot create directory "PATHFMT": %s",
-						COLLPATH(stuff, name), strerror(errno));
-				flags |= FLAG_ERROR;
-				continue;
-			}
-			INFO("created directory "PATHFMT, COLLPATH(stuff, name));
-			flags |= go_deeper(cmd_add, fdsrc, fdsym, name, stuff, MAX(depth - 1, -1), NULL) | FLAG_NONEMPTY;
-		}
-		else
-			flags |= create_symlink(fdsym, name, stuff);
 	}
 	if(errno)
 	{
-		ERROR("cannot read "PATHFMT": %s", DIRPATH(stuff, NULL), strerror(errno));
+		ERROR("cannot read '"PATHFMT"': %s", DIRPATH(stuff, NULL), strerror(errno));
 		flags |= FLAG_ERROR;
 	}
 
@@ -667,7 +653,7 @@ static int cmd_refresh(int fdsrc, DIR *dsrc, int fdsym, DIR *dsym, struct asd *s
 	while(errno = 0, (ent = readdir(dsym)))
 	{
 		const char *name = ent->d_name;
-		if(name[0] == '.' && (!name[1] || (name[1] == '.' && !name[2])))
+		if(is_pdir_cdir(name))
 			continue;
 
 		int exists;
@@ -678,7 +664,7 @@ static int cmd_refresh(int fdsrc, DIR *dsrc, int fdsym, DIR *dsym, struct asd *s
 				exists = 0;
 			else
 			{
-				ERROR("cannot access "PATHFMT": %s", DIRPATH(stuff, name), strerror(errno));
+				ERROR("cannot access '"PATHFMT"': %s", DIRPATH(stuff, name), strerror(errno));
 				flags |= FLAG_ERROR;
 				continue;
 			}
@@ -686,56 +672,26 @@ static int cmd_refresh(int fdsrc, DIR *dsrc, int fdsym, DIR *dsym, struct asd *s
 		else
 			exists = 1;
 
-		if(growing_readlinkat(fdsym, name, stuff) < 0)
+		struct stat stcoll;
+		flags |= rm_symlink(fdsym, stuff, name, &stcoll, exists);
+		switch(flags & FLAG_RM_NONLINK)
 		{
-			struct stat stcoll;
-			if(errno != EINVAL || fstatat(fdsym, name, &stcoll, AT_SYMLINK_NOFOLLOW) < 0)
-			{
-				if(errno != ENOENT)
-				{
-					ERROR("cannot access "PATHFMT": %s", COLLPATH(stuff, name), strerror(errno));
-					flags |= FLAG_ERROR;
-				}
-			}
-			else if(!exists)
-			{
-				if(S_ISDIR(stcoll.st_mode))
-					flags |= remove_dir(fdsym, name, stuff);
-				else
-					flags |= SKIP_NONLINK_MSG(stuff, name);
-			}
-			else if(S_ISDIR(stdir.st_mode) != S_ISDIR(stcoll.st_mode))
+			flags &= ~FLAG_RM_NONLINK;
+			if(S_ISDIR(stdir.st_mode) != S_ISDIR(stcoll.st_mode))
 				flags |= DIR_CONFLICT_ERROR(stuff, name, stdir, stcoll);
 			else if(S_ISDIR(stcoll.st_mode))
 				flags |= go_deeper(cmd_refresh, fdsrc, fdsym, name, stuff, -1, NULL);
 			else
 			{
 				// conflicting file exists
-				ERROR(PATHFMT" is a %s", COLLPATH(stuff, name), filetype(stcoll.st_mode));
+				ERROR("'"PATHFMT"' is a %s", COLLPATH(stuff, name), filetype(stcoll.st_mode));
 				flags |= FLAG_NONEMPTY;
 			}
 		}
-		else if(path_eq_link(stuff, name))
-		{
-			// symlink to the same file
-			if(exists)
-				flags |= KEEP_LINK_MSG(stuff, name);
-			else if(unlinkat(fdsym, name, 0) < 0)
-			{
-				if(errno == ENOENT)
-					continue;
-				ERROR("cannot unlink "PATHFMT": %s", COLLPATH(stuff, name), strerror(errno));
-				flags |= FLAG_ERROR | FLAG_NONEMPTY;
-			}
-			else
-				INFO("removed "PATHFMT, COLLPATH(stuff, name));
-		}
-		else if(!path_valid_link(stuff, name))
-			flags |= INVALID_SYMLINK_ERROR(stuff, name);
 	}
 	if(errno)
 	{
-		ERROR("cannot read "PATHFMT": %s", COLLPATH(stuff, NULL), strerror(errno));
+		ERROR("cannot read '"PATHFMT"': %s", COLLPATH(stuff, NULL), strerror(errno));
 		flags |= FLAG_ERROR | FLAG_NONEMPTY;
 	}
 

@@ -1,4 +1,4 @@
-cflags = -std=c99 -O2 -Wall -Wextra -Wpedantic -Wshadow \
+cflags = -std=c99 -g -O2 -Wall -Wextra -Wpedantic -Wshadow \
 		-Werror=implicit-function-declaration -Werror=vla \
 		$(CFLAGS)
 ldflags = $(LDFLAGS)
@@ -8,6 +8,9 @@ DESTDIR ?=
 
 INSTALL ?= install
 RST2MAN ?= rst2man.py
+
+CC ?= cc
+RM ?= rm -f
 
 all:   build doc
 build: symdir
