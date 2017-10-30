@@ -49,6 +49,7 @@ COMMANDS
 		repeat the process for this directory.
 
 		*option*
+
 			all `global options`_ are also accepted
 
 			**-d, --depth=<depth>**
@@ -59,6 +60,7 @@ COMMANDS
 		from the collection.
 
 		*option*
+
 			all `global options`_ are accepted
 
 	**refresh**
@@ -66,6 +68,7 @@ COMMANDS
 		*dir* that no longer exist and empty directories from the collection.
 
 		*option*
+
 			all `global options`_ are also accepted
 
 			**-d, --depth=<depth>**
