@@ -754,7 +754,7 @@ int main(int argc, char **argv)
 
 	static const struct option addopts[] = {
 		{"collection", required_argument, NULL, 'c'},
-		{"depth",      no_argument,       NULL, 'd'},
+		{"depth",      required_argument, NULL, 'd'},
 		{"help",       no_argument,       NULL, 'h'},
 		{"verbose",    no_argument,       NULL, 'v'},
 		{NULL, 0, NULL, 0}
